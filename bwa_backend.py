@@ -21,7 +21,7 @@ load_dotenv()
 # ============================================================
 # Blog Writer (Router → (Research?) → Orchestrator → Workers → ReducerWithImages)
 # Patches image capability using your 3-node reducer flow:
-#   merge_content -> decide_images -> generate_and_place_images
+#   merge_content -> decide_images -> generate_and_place_images.
 # ============================================================
 
 
