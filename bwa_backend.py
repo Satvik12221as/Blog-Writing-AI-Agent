@@ -12,7 +12,7 @@ from pydantic import BaseModel, Field
 from langgraph.graph import StateGraph, START, END
 from langgraph.types import Send
 
-from langchain_openai import ChatOpenAI
+from langchain_ollama import ChatOllama
 from langchain_core.messages import SystemMessage, HumanMessage
 from dotenv import load_dotenv
 
@@ -113,8 +113,11 @@ class State(TypedDict):
 # -----------------------------
 # 2) LLM
 # -----------------------------
-llm = ChatOpenAI(model="gpt-4.1-mini")
-
+llm = ChatOllama(
+    model="tinyllama",
+    temperature=0.1,
+    format="json"
+)
 # -----------------------------
 # 3) Router
 # -----------------------------
@@ -130,15 +133,40 @@ Modes:
 If needs_research=true:
 - Output 3–10 high-signal, scoped queries.
 - For open_book weekly roundup, include queries reflecting last 7 days.
+Return ONLY valid JSON.
+Do not add explanations.
+Do not wrap in markdown.
 """
 
 def router_node(state: State) -> dict:
-    decider = llm.with_structured_output(RouterDecision)
-    decision = decider.invoke(
+    import json
+    import re
+    response = llm.invoke(
         [
             SystemMessage(content=ROUTER_SYSTEM),
-            HumanMessage(content=f"Topic: {state['topic']}\nAs-of date: {state['as_of']}"),
+            HumanMessage(content=f"Topic: {state['topic']}\nAs-of date: {state['as_of']}"), 
         ]
+    ).content
+
+    # Extract JSON safely
+    match = re.search(r"\{.*\}", response, re.DOTALL)
+    if not match:
+        raise ValueError(f"Router response does not contain valid JSON: {response}")
+    json_str = match.group(0)
+    try:
+        decision_data = json.loads(json_str)
+    except json.JSONDecodeError as e:
+        raise ValueError(f"Failed to parse router JSON: {e}\nResponse was: {response}")
+    try:
+        decision = RouterDecision(**decision_data)
+    except Exception:
+    # fallback default for weak models
+        decision = RouterDecision(
+        needs_research=False,
+        mode="closed_book",
+        reason="Fallback decision due to invalid model output",
+        queries=[],
+        max_results_per_query=5
     )
 
     if decision.mode == "open_book":
@@ -201,6 +229,9 @@ Rules:
 - Normalize published_at to ISO YYYY-MM-DD if reliably inferable; else null (do NOT guess).
 - Keep snippets short.
 - Deduplicate by URL.
+Return ONLY valid JSON.
+No explanations.
+No markdown.
 """
 
 def research_node(state: State) -> dict:
@@ -212,8 +243,9 @@ def research_node(state: State) -> dict:
     if not raw:
         return {"evidence": []}
 
-    extractor = llm.with_structured_output(EvidencePack)
-    pack = extractor.invoke(
+    import json
+    import re
+    response = llm.invoke(
         [
             SystemMessage(content=RESEARCH_SYSTEM),
             HumanMessage(
@@ -222,9 +254,19 @@ def research_node(state: State) -> dict:
                     f"Recency days: {state['recency_days']}\n\n"
                     f"Raw results:\n{raw}"
                 )
-            ),
+            )
         ]
-    )
+    ).content
+
+    match = re.search(r"\{.*\}", response, re.DOTALL)
+    if not match:
+        raise ValueError(f"Research node response does not contain valid JSON: {response}")
+    json_str = match.group(0)
+    try:
+        evidence_data = json.loads(json_str)
+    except json.JSONDecodeError as e:
+        raise ValueError(f"Failed to parse research node JSON: {e}\nResponse was: {response}")
+    pack = EvidencePack(**evidence_data)
 
     dedup = {}
     for e in pack.evidence:
@@ -246,7 +288,7 @@ ORCH_SYSTEM = """You are a senior technical writer and developer advocate.
 Produce a highly actionable outline for a technical blog post.
 
 Requirements:
-- 5–9 tasks, each with goal + 3–6 bullets + target_words.
+- 3-5 tasks, each with goal + 3–6 bullets + target_words.
 - Tags are flexible; do not force a fixed taxonomy.
 
 Grounding:
@@ -258,29 +300,44 @@ Grounding:
   - If evidence is weak, plan should explicitly reflect that (don’t invent events).
 
 Output must match Plan schema.
+Return ONLY valid JSON.
+Do not include explanation.
+Do not wrap in markdown.
 """
 
 def orchestrator_node(state: State) -> dict:
-    planner = llm.with_structured_output(Plan)
     mode = state.get("mode", "closed_book")
     evidence = state.get("evidence", [])
 
     forced_kind = "news_roundup" if mode == "open_book" else None
 
-    plan = planner.invoke(
+    import json
+    import re
+    response = llm.invoke(
         [
             SystemMessage(content=ORCH_SYSTEM),
             HumanMessage(
                 content=(
                     f"Topic: {state['topic']}\n"
                     f"Mode: {mode}\n"
-                    f"As-of: {state['as_of']} (recency_days={state['recency_days']})\n"
-                    f"{'Force blog_kind=news_roundup' if forced_kind else ''}\n\n"
-                    f"Evidence:\n{[e.model_dump() for e in evidence][:16]}"
+                    f"As-of: {state['as_of']} (recency_days={state['recency_days']})\n\n"
+                    f"Evidence (ONLY use these for hybrid/open_book):\n{[e.model_dump() for e in evidence]}"
                 )
-            ),
+            )
         ]
-    )
+    ).content
+
+    # Extract JSON safely
+    match = re.search(r"\{.*\}", response, re.DOTALL)
+    if not match:
+        raise ValueError(f"Orchestrator response does not contain valid JSON: {response}")
+    json_str = match.group(0)
+    try:
+        plan_data = json.loads(json_str)
+    except json.JSONDecodeError as e:
+        raise ValueError(f"Failed to parse orchestrator JSON: {e}\nResponse was: {response}")
+    plan = Plan(**plan_data)
+
     if forced_kind:
         plan.blog_kind = "news_roundup"
 
@@ -400,24 +457,37 @@ Return strictly GlobalImagePlan.
 """
 
 def decide_images(state: State) -> dict:
-    planner = llm.with_structured_output(GlobalImagePlan)
     merged_md = state["merged_md"]
     plan = state["plan"]
     assert plan is not None
 
-    image_plan = planner.invoke(
+
+    import json
+    import re
+    response = llm.invoke(
         [
             SystemMessage(content=DECIDE_IMAGES_SYSTEM),
             HumanMessage(
                 content=(
-                    f"Blog kind: {plan.blog_kind}\n"
-                    f"Topic: {state['topic']}\n\n"
-                    "Insert placeholders + propose image prompts.\n\n"
-                    f"{merged_md}"
+                    f"Blog title: {plan.blog_title}\n"
+                    f"Audience: {plan.audience}\n"
+                    f"Tone: {plan.tone}\n"
+                    f"Blog kind: {plan.blog_kind}\n\n"
+                    f"Merged markdown:\n{merged_md}"
                 )
             ),
         ]
-    )
+    ).content
+    
+    match = re.search(r"\{.*\}", response, re.DOTALL)
+    if not match:
+        raise ValueError(f"decide_images response does not contain valid JSON: {response}")
+    json_str = match.group(0)
+    try:
+        image_plan_data = json.loads(json_str)
+    except json.JSONDecodeError as e:
+        raise ValueError(f"Failed to parse decide_images JSON: {e}\nResponse was: {response}")
+    image_plan = GlobalImagePlan(**image_plan_data)
 
     return {
         "md_with_placeholders": image_plan.md_with_placeholders,
