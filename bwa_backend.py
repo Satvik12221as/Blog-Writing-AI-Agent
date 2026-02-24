@@ -148,7 +148,7 @@ def router_node(state: State) -> dict:
         ]
     ).content
 
-    # Extract JSON safely
+    # Extract JSON safely.
     match = re.search(r"\{.*\}", response, re.DOTALL)
     if not match:
         raise ValueError(f"Router response does not contain valid JSON: {response}")
