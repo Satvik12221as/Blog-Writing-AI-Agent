@@ -89,7 +89,7 @@ def extract_latest_state(current_state: Dict[str, Any], step_payload: Any) -> Di
 
 
 # -----------------------------
-# Markdown renderer that supports local image
+# Markdown renderer that supports local images
 # -----------------------------
 _MD_IMG_RE = re.compile(r"!\[(?P<alt>[^\]]*)\]\((?P<src>[^)]+)\)")
 _CAPTION_LINE_RE = re.compile(r"^\*(?P<cap>.+)\*$")
