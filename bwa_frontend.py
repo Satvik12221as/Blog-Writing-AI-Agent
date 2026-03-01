@@ -12,9 +12,9 @@ from typing import Any, Dict, Optional, List, Iterator, Tuple
 import pandas as pd
 import streamlit as st
 
-# -----------------------------
+# -------------------------------
 # Import your compiled LangGraph app
-# -----------------------------
+# -------------------------------
 from bwa_backend import app
 
 
