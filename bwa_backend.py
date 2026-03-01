@@ -2,7 +2,17 @@ from __future__ import annotations
 
 import operator
 import os
+import json
 import re
+from urllib import response
+def safe_json_extract(text):
+    match = re.search(r"\{.*\}", text, re.DOTALL)
+    if not match:
+        return None
+    try:
+        return json.loads(match.group(0))
+    except:
+        return None
 from datetime import date, timedelta
 from pathlib import Path
 from typing import TypedDict, List, Optional, Literal, Annotated
@@ -12,7 +22,7 @@ from pydantic import BaseModel, Field
 from langgraph.graph import StateGraph, START, END
 from langgraph.types import Send
 
-from langchain_ollama import ChatOllama
+from langchain_groq import ChatGroq
 from langchain_core.messages import SystemMessage, HumanMessage
 from dotenv import load_dotenv
 
@@ -113,10 +123,10 @@ class State(TypedDict):
 # -----------------------------
 # 2) LLM
 # -----------------------------
-llm = ChatOllama(
-    model="tinyllama",
-    temperature=0.1,
-    format="json"
+llm = ChatGroq(
+    model="llama-3.3-70b-versatile",
+    temperature=0.2,
+    api_key=os.getenv("GROQ_API_KEY")
 )
 # -----------------------------
 # 3) Router
@@ -141,34 +151,42 @@ Do not wrap in markdown.
 def router_node(state: State) -> dict:
     import json
     import re
-    response = llm.invoke(
-        [
-            SystemMessage(content=ROUTER_SYSTEM),
-            HumanMessage(content=f"Topic: {state['topic']}\nAs-of date: {state['as_of']}"), 
-        ]
-    ).content
+    response = llm.invoke([
+        SystemMessage(content=ROUTER_SYSTEM),
 
-    # Extract JSON safely.
-    match = re.search(r"\{.*\}", response, re.DOTALL)
-    if not match:
-        raise ValueError(f"Router response does not contain valid JSON: {response}")
-    json_str = match.group(0)
-    try:
-        decision_data = json.loads(json_str)
-    except json.JSONDecodeError as e:
-        raise ValueError(f"Failed to parse router JSON: {e}\nResponse was: {response}")
+        HumanMessage(content=f"Topic: {state['topic']}\nAs-of date: {state['as_of']}")
+    ]).content
+
+    decision_data = safe_json_extract(response)
+
+    if not decision_data:
+        decision_data = {
+            "needs_research": False,
+            "mode": "closed_book",
+            "reason": "Fallback due to invalid model output",
+            "queries": [],
+            "max_results_per_query": 5
+        }
+
+    decision_data.setdefault("needs_research", False)
+    decision_data.setdefault("mode", "closed_book")
+    decision_data.setdefault("reason", "Auto-filled reason")
+    decision_data.setdefault("queries", [])
+    decision_data.setdefault("max_results_per_query", 5)
+
     try:
         decision = RouterDecision(**decision_data)
     except Exception:
-    # fallback default for weak models
+        # Final safety fallback
         decision = RouterDecision(
-        needs_research=False,
-        mode="closed_book",
-        reason="Fallback decision due to invalid model output",
-        queries=[],
-        max_results_per_query=5
-    )
+            needs_research=False,
+            mode="closed_book",
+            reason="Validation fallback",
+            queries=[],
+            max_results_per_query=5
+        )
 
+    # Recency logic
     if decision.mode == "open_book":
         recency_days = 7
     elif decision.mode == "hybrid":
@@ -183,41 +201,53 @@ def router_node(state: State) -> dict:
         "recency_days": recency_days,
     }
 
+
 def route_next(state: State) -> str:
     return "research" if state["needs_research"] else "orchestrator"
 
 # -----------------------------
 # 4) Research (Tavily)
 # -----------------------------
-def _tavily_search(query: str, max_results: int = 5) -> List[dict]:
-    if not os.getenv("TAVILY_API_KEY"):
-        return []
-    try:
-        from langchain_community.tools.tavily_search import TavilySearchResults  # type: ignore
-        tool = TavilySearchResults(max_results=max_results)
-        results = tool.invoke({"query": query})
-        out: List[dict] = []
-        for r in results or []:
-            out.append(
-                {
-                    "title": r.get("title") or "",
-                    "url": r.get("url") or "",
-                    "snippet": r.get("content") or r.get("snippet") or "",
-                    "published_at": r.get("published_date") or r.get("published_at"),
-                    "source": r.get("source"),
-                }
-            )
-        return out
-    except Exception:
-        return []
 
-def _iso_to_date(s: Optional[str]) -> Optional[date]:
-    if not s:
+def _iso_to_date(iso_str: Optional[str]) -> Optional[date]:
+    """Convert ISO 'YYYY-MM-DD' string to date object, or return None."""
+    if not iso_str:
         return None
     try:
-        return date.fromisoformat(s[:10])
-    except Exception:
+        return date.fromisoformat(iso_str)
+    except (ValueError, TypeError):
         return None
+
+
+def _tavily_search(query: str, max_results: int = 5) -> List[dict]:
+    """
+    Perform web search using Tavily API.
+    Requires: pip install tavily-python
+    Env var: TAVILY_API_KEY
+    """
+    try:
+        from tavily import TavilyClient
+    except ImportError:
+        raise RuntimeError("tavily-python not installed. Run: pip install tavily-python")
+    
+    api_key = os.environ.get("TAVILY_API_KEY")
+    if not api_key:
+        raise RuntimeError("TAVILY_API_KEY is not set.")
+    
+    client = TavilyClient(api_key=api_key)
+    response = client.search(query=query, max_results=max_results)
+    
+    # Extract results in a standardized format
+    results = []
+    for result in response.get("results", []):
+        results.append({
+            "title": result.get("title", ""),
+            "url": result.get("url", ""),
+            "published_at": result.get("published_date", None),
+            "snippet": result.get("content", ""),
+            "source": result.get("source", "")
+        })
+    return results
 
 RESEARCH_SYSTEM = """You are a research synthesizer.
 
@@ -229,6 +259,7 @@ Rules:
 - Normalize published_at to ISO YYYY-MM-DD if reliably inferable; else null (do NOT guess).
 - Keep snippets short.
 - Deduplicate by URL.
+
 Return ONLY valid JSON.
 No explanations.
 No markdown.
@@ -237,14 +268,13 @@ No markdown.
 def research_node(state: State) -> dict:
     queries = (state.get("queries") or [])[:10]
     raw: List[dict] = []
+
     for q in queries:
-        raw.extend(_tavily_search(q, max_results=6))
+        raw.extend(_tavily_search(q, max_results=3))
 
     if not raw:
         return {"evidence": []}
 
-    import json
-    import re
     response = llm.invoke(
         [
             SystemMessage(content=RESEARCH_SYSTEM),
@@ -258,26 +288,38 @@ def research_node(state: State) -> dict:
         ]
     ).content
 
-    match = re.search(r"\{.*\}", response, re.DOTALL)
-    if not match:
-        raise ValueError(f"Research node response does not contain valid JSON: {response}")
-    json_str = match.group(0)
-    try:
-        evidence_data = json.loads(json_str)
-    except json.JSONDecodeError as e:
-        raise ValueError(f"Failed to parse research node JSON: {e}\nResponse was: {response}")
-    pack = EvidencePack(**evidence_data)
+    evidence_data = safe_json_extract(response)
 
+    # 🔹 Fallback if Groq fails to produce valid JSON
+    if not evidence_data or "evidence" not in evidence_data:
+        return {"evidence": []}
+
+    try:
+        pack = EvidencePack(**evidence_data)
+    except Exception:
+        # If validation fails, skip research safely
+        return {"evidence": []}
+
+    # 🔹 Deduplicate by URL
     dedup = {}
     for e in pack.evidence:
         if e.url:
             dedup[e.url] = e
+
     evidence = list(dedup.values())
 
+    # 🔹 Apply recency filter for open_book mode
     if state.get("mode") == "open_book":
-        as_of = date.fromisoformat(state["as_of"])
-        cutoff = as_of - timedelta(days=int(state["recency_days"]))
-        evidence = [e for e in evidence if (d := _iso_to_date(e.published_at)) and d >= cutoff]
+        try:
+            as_of = date.fromisoformat(state["as_of"])
+            cutoff = as_of - timedelta(days=int(state["recency_days"]))
+            evidence = [
+                e for e in evidence
+                if (d := _iso_to_date(e.published_at)) and d >= cutoff
+            ]
+        except Exception:
+            # Never crash on date issues
+            pass
 
     return {"evidence": evidence}
 
@@ -311,8 +353,6 @@ def orchestrator_node(state: State) -> dict:
 
     forced_kind = "news_roundup" if mode == "open_book" else None
 
-    import json
-    import re
     response = llm.invoke(
         [
             SystemMessage(content=ORCH_SYSTEM),
@@ -321,29 +361,107 @@ def orchestrator_node(state: State) -> dict:
                     f"Topic: {state['topic']}\n"
                     f"Mode: {mode}\n"
                     f"As-of: {state['as_of']} (recency_days={state['recency_days']})\n\n"
-                    f"Evidence (ONLY use these for hybrid/open_book):\n{[e.model_dump() for e in evidence]}"
+                    f"Evidence (ONLY use these for hybrid/open_book):\n"
+                    f"{[e.model_dump() for e in evidence]}"
                 )
             )
         ]
     ).content
 
-    # Extract JSON safely
-    match = re.search(r"\{.*\}", response, re.DOTALL)
-    if not match:
-        raise ValueError(f"Orchestrator response does not contain valid JSON: {response}")
-    json_str = match.group(0)
+    plan_data = safe_json_extract(response)
+
+   # 🔹 Fallback if JSON extraction fails
+    if not plan_data:
+        plan_data = {
+        "blog_title": state["topic"],
+        "audience": "General developers",
+        "tone": "Informative",
+        "blog_kind": "explainer",
+        "tasks": [
+            {
+                "id": 1,
+                "title": "Introduction",
+                "goal": "Introduce the topic clearly",
+                "bullets": [
+                    "Context",
+                    "Why it matters",
+                    "What readers will learn"
+                ],
+                "target_words": 300,
+                "requires_research": False,
+                "requires_citations": False,
+                "requires_code": False,
+                "tags": []
+            },
+            {
+                "id": 2,
+                "title": "Core Concepts",
+                "goal": "Explain main ideas",
+                "bullets": [
+                    "Concept explanation",
+                    "Examples",
+                    "Best practices"
+                ],
+                "target_words": 600,
+                "requires_research": False,
+                "requires_citations": False,
+                "requires_code": False,
+                "tags": []
+            },
+            {
+                "id": 3,
+                "title": "Conclusion",
+                "goal": "Summarize and provide next steps",
+                "bullets": [
+                    "Key takeaways",
+                    "Practical advice"
+                ],
+                "target_words": 300,
+                "requires_research": False,
+                "requires_citations": False,
+                "requires_code": False,
+                "tags": []
+            }
+        ]
+    }
+    # 🔹 Ensure required keys exist (Groq safety)
+    plan_data.setdefault("blog_title", state["topic"])
+    plan_data.setdefault("audience", "General developers")
+    plan_data.setdefault("tone", "Informative")
+    plan_data.setdefault("blog_kind", "explainer")
+    plan_data.setdefault("tasks", [])
+
     try:
-        plan_data = json.loads(json_str)
-    except json.JSONDecodeError as e:
-        raise ValueError(f"Failed to parse orchestrator JSON: {e}\nResponse was: {response}")
-    plan = Plan(**plan_data)
+        plan = Plan(**plan_data)
+    except Exception:
+        # Final fallback if structure partially invalid
+        plan = Plan(
+            blog_title=state["topic"],
+            audience="General developers",
+            tone="Informative",
+            blog_kind="explainer",
+            tasks=[]
+        )
+    
+    if not plan.tasks:
+        plan.tasks = [
+        Task(
+            id=1,
+            title="Overview",
+            goal="Explain the core topic clearly",
+            bullets=[
+                "Definition",
+                "Why it matters",
+                "Key implications"
+            ],
+            target_words=600
+        )
+    ]
 
     if forced_kind:
         plan.blog_kind = "news_roundup"
 
     return {"plan": plan}
-
-
 # -----------------------------
 # 6) Fanout
 # -----------------------------
@@ -461,9 +579,6 @@ def decide_images(state: State) -> dict:
     plan = state["plan"]
     assert plan is not None
 
-
-    import json
-    import re
     response = llm.invoke(
         [
             SystemMessage(content=DECIDE_IMAGES_SYSTEM),
@@ -478,16 +593,28 @@ def decide_images(state: State) -> dict:
             ),
         ]
     ).content
-    
-    match = re.search(r"\{.*\}", response, re.DOTALL)
-    if not match:
-        raise ValueError(f"decide_images response does not contain valid JSON: {response}")
-    json_str = match.group(0)
+
+    image_plan_data = safe_json_extract(response)
+
+    # 🔹 If Groq fails to return valid JSON, skip images safely
+    if not image_plan_data:
+        return {
+            "md_with_placeholders": merged_md,
+            "image_specs": [],
+        }
+
+    # Ensure required keys exist
+    image_plan_data.setdefault("md_with_placeholders", merged_md)
+    image_plan_data.setdefault("images", [])
+
     try:
-        image_plan_data = json.loads(json_str)
-    except json.JSONDecodeError as e:
-        raise ValueError(f"Failed to parse decide_images JSON: {e}\nResponse was: {response}")
-    image_plan = GlobalImagePlan(**image_plan_data)
+        image_plan = GlobalImagePlan(**image_plan_data)
+    except Exception:
+        # Final fallback safety
+        return {
+            "md_with_placeholders": merged_md,
+            "image_specs": [],
+        }
 
     return {
         "md_with_placeholders": image_plan.md_with_placeholders,
@@ -619,7 +746,7 @@ g.add_edge(START, "router")
 g.add_conditional_edges("router", route_next, {"research": "research", "orchestrator": "orchestrator"})
 g.add_edge("research", "orchestrator")
 
-g.add_conditional_edges("orchestrator", fanout, ["worker"])
+g.add_conditional_edges("orchestrator", fanout)
 g.add_edge("worker", "reducer")
 g.add_edge("reducer", END)
 

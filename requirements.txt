@@ -1,0 +1,14 @@
+streamlit==1.33.0
+
+langchain==0.2.16
+langgraph==0.2.28
+langchain-groq
+langchain-community==0.2.16
+
+openai==1.40.6
+tavily-python==0.5.0
+google-generativeai==0.7.2
+
+pandas==2.2.2
+python-dotenv==1.0.1
+
