@@ -28,11 +28,11 @@ from dotenv import load_dotenv
 
 load_dotenv()
 
-# ============================================================
+# ==============================================================================
 # Blog Writer (Router → (Research?) → Orchestrator → Workers → ReducerWithImages)
 # Patches image capability using your 3-node reducer flow:
-#   merge_content -> decide_images -> generate_and_place_images.
-# ============================================================
+# merge_content -> decide_images -> generate_and_place_images.
+# ==============================================================================
 
 
 # -----------------------------
@@ -141,11 +141,8 @@ Modes:
 - open_book (needs_research=true): volatile weekly/news/"latest"/pricing/policy.
 
 If needs_research=true:
-- Output 3–10 high-signal, scoped queries.
+- Output 8–15 focused subtopic queries covering different dimensions of the topic.
 - For open_book weekly roundup, include queries reflecting last 7 days.
-Return ONLY valid JSON.
-Do not add explanations.
-Do not wrap in markdown.
 """
 
 def router_node(state: State) -> dict:
@@ -259,10 +256,6 @@ Rules:
 - Normalize published_at to ISO YYYY-MM-DD if reliably inferable; else null (do NOT guess).
 - Keep snippets short.
 - Deduplicate by URL.
-
-Return ONLY valid JSON.
-No explanations.
-No markdown.
 """
 
 def research_node(state: State) -> dict:
@@ -270,7 +263,7 @@ def research_node(state: State) -> dict:
     raw: List[dict] = []
 
     for q in queries:
-        raw.extend(_tavily_search(q, max_results=3))
+        raw.extend(_tavily_search(q, max_results=5))
 
     if not raw:
         return {"evidence": []}
@@ -330,7 +323,7 @@ ORCH_SYSTEM = """You are a senior technical writer and developer advocate.
 Produce a highly actionable outline for a technical blog post.
 
 Requirements:
-- 3-5 tasks, each with goal + 3–6 bullets + target_words.
+- 6-8 tasks, each with goal + 3–6 bullets + target_words.
 - Tags are flexible; do not force a fixed taxonomy.
 
 Grounding:
@@ -342,9 +335,6 @@ Grounding:
   - If evidence is weak, plan should explicitly reflect that (don’t invent events).
 
 Output must match Plan schema.
-Return ONLY valid JSON.
-Do not include explanation.
-Do not wrap in markdown.
 """
 
 def orchestrator_node(state: State) -> dict:
