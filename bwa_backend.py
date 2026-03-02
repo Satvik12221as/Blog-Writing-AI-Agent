@@ -462,9 +462,9 @@ def orchestrator_node(state: State) -> dict:
         plan.blog_kind = "news_roundup"
 
     return {"plan": plan}
-# ---------------------------
+# -------------------------
 # 6) Fanout
-# ---------------------------
+# -------------------------
 def fanout(state: State):
     assert state["plan"] is not None
     return [
