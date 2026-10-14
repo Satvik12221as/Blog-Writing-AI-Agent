@@ -21,7 +21,7 @@ from pydantic import BaseModel, Field
 
 from langgraph.graph import StateGraph, START, END
 from langgraph.types import Send
-
+from langchain_google_genai import ChatGoogleGenerativeAI
 from langchain_groq import ChatGroq
 from langchain_core.messages import SystemMessage, HumanMessage
 from dotenv import load_dotenv
@@ -123,10 +123,10 @@ class State(TypedDict):
 # -----------------------------
 # 2) LLM
 # -----------------------------
-llm = ChatGroq(
-    model="llama-3.1-8b-instant",
+llm = ChatGoogleGenerativeAI(
+    model="gemini-2.5-flash-lite",
     temperature=0.4,
-    api_key=os.getenv("GROQ_API_KEY")
+    google_api_key=os.getenv("GOOGLE_API_KEY")
 )
 # -----------------------------
 # 3) Router
