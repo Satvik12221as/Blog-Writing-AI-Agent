@@ -4,6 +4,8 @@ import operator
 import os
 import json
 import re
+import base64
+import html
 from urllib import response
 def safe_json_extract(text):
     match = re.search(r"\{.*\}", text, re.DOTALL)
@@ -640,16 +642,75 @@ def merge_content(state: State) -> dict:
 
 
 DECIDE_IMAGES_SYSTEM = """You are an expert technical editor.
-Decide if images/diagrams are needed for THIS blog.
+Plan useful images/diagrams for THIS blog and insert their placeholders into the markdown.
 
 Rules:
+- Always include at least 1 image.
+- Include 2-3 images when the blog has enough distinct sections for them.
 - Max 3 images total.
 - Each image must materially improve understanding (diagram/flow/table-like visual).
 - Insert placeholders exactly: [[IMAGE_1]], [[IMAGE_2]], [[IMAGE_3]].
-- If no images needed: md_with_placeholders must equal input and images=[].
-- Avoid decorative images; prefer technical diagrams with short labels.
-Return strictly GlobalImagePlan.
+- Do not place more placeholders than there are image objects.
+- Avoid purely decorative images; prefer diagrams, timelines, comparison visuals, or editorial explainers with short labels.
+- Filenames must be simple names only, such as ai_adoption_timeline.png. Do not include folders.
+Return ONLY valid JSON using this exact schema:
+{"md_with_placeholders":"markdown with placeholders inserted","images":[{"placeholder":"[[IMAGE_1]]","filename":"descriptive_name.png","alt":"short alt text","caption":"short caption","prompt":"detailed image-generation prompt","size":"1536x1024","quality":"medium"}]}
 """
+
+
+def _insert_after_paragraph(md: str, placeholder: str, paragraph_index: int = 1) -> str:
+    parts = md.split("\n\n")
+    if len(parts) <= 1:
+        return f"{md.rstrip()}\n\n{placeholder}\n"
+
+    insert_at = min(max(paragraph_index, 1), len(parts))
+    parts.insert(insert_at, placeholder)
+    return "\n\n".join(parts)
+
+
+def _fallback_image_plan(merged_md: str, plan: Plan) -> GlobalImagePlan:
+    filename_base = _safe_slug(plan.blog_title)
+    placeholder = "[[IMAGE_1]]"
+    md_with_placeholder = merged_md if placeholder in merged_md else _insert_after_paragraph(merged_md, placeholder, 1)
+
+    if plan.blog_kind == "comparison":
+        visual_direction = "Create a clear side-by-side comparison infographic"
+    elif plan.blog_kind == "tutorial":
+        visual_direction = "Create a clean step-by-step workflow diagram"
+    elif plan.blog_kind == "news_roundup":
+        visual_direction = "Create an editorial timeline-style visual"
+    elif plan.blog_kind == "system_design":
+        visual_direction = "Create a simple system architecture diagram"
+    else:
+        visual_direction = "Create a clean editorial explainer diagram"
+
+    return GlobalImagePlan(
+        md_with_placeholders=md_with_placeholder,
+        images=[
+            ImageSpec(
+                placeholder=placeholder,
+                filename=f"{filename_base}_visual.png",
+                alt=f"Visual explainer for {plan.blog_title}",
+                caption=f"A visual overview of {plan.blog_title}.",
+                prompt=(
+                    f"{visual_direction} for a blog titled '{plan.blog_title}'. "
+                    f"Audience: {plan.audience}. Tone: {plan.tone}. "
+                    "Use concise labels, strong hierarchy, and no tiny unreadable text. "
+                    "Make it useful for understanding the article, not decorative stock art."
+                ),
+                size="1536x1024",
+                quality="medium",
+            )
+        ],
+    )
+
+
+def _ensure_image_placeholders(md: str, images: List[ImageSpec]) -> str:
+    for index, image in enumerate(images[:3], start=1):
+        if image.placeholder not in md:
+            md = _insert_after_paragraph(md, image.placeholder, index * 2)
+    return md
+
 
 def decide_images(state: State) -> dict:
     merged_md = state["merged_md"]
@@ -675,9 +736,10 @@ def decide_images(state: State) -> dict:
 
     # 🔹 If Groq fails to return valid JSON, skip images safely
     if not image_plan_data:
+        image_plan = _fallback_image_plan(merged_md, plan)
         return {
-            "md_with_placeholders": merged_md,
-            "image_specs": [],
+            "md_with_placeholders": image_plan.md_with_placeholders,
+            "image_specs": [img.model_dump() for img in image_plan.images],
         }
 
     # Ensure required keys exist
@@ -687,11 +749,20 @@ def decide_images(state: State) -> dict:
     try:
         image_plan = GlobalImagePlan(**image_plan_data)
     except Exception:
-        # Final fallback safety
+        image_plan = _fallback_image_plan(merged_md, plan)
         return {
-            "md_with_placeholders": merged_md,
-            "image_specs": [],
+            "md_with_placeholders": image_plan.md_with_placeholders,
+            "image_specs": [img.model_dump() for img in image_plan.images],
         }
+
+    if not image_plan.images:
+        image_plan = _fallback_image_plan(merged_md, plan)
+
+    image_plan.images = image_plan.images[:3]
+    image_plan.md_with_placeholders = _ensure_image_placeholders(
+        image_plan.md_with_placeholders,
+        image_plan.images,
+    )
 
     return {
         "md_with_placeholders": image_plan.md_with_placeholders,
@@ -742,7 +813,10 @@ def _gemini_generate_image_bytes(prompt: str) -> bytes:
     for part in parts:
         inline = getattr(part, "inline_data", None)
         if inline and getattr(inline, "data", None):
-            return inline.data
+            data = inline.data
+            if isinstance(data, str):
+                return base64.b64decode(data)
+            return data
 
     raise RuntimeError("No inline image bytes found in response.")
 
@@ -752,6 +826,34 @@ def _safe_slug(title: str) -> str:
     s = re.sub(r"[^a-z0-9 _-]+", "", s)
     s = re.sub(r"\s+", "_", s).strip("_")
     return s or "blog"
+
+
+def _safe_image_filename(filename: str, fallback: str) -> str:
+    raw_name = Path((filename or "").strip()).name
+    stem = Path(raw_name).stem or fallback
+    suffix = Path(raw_name).suffix.lower()
+    if suffix not in {".png", ".jpg", ".jpeg", ".webp", ".svg"}:
+        suffix = ".png"
+    return f"{_safe_slug(stem)}{suffix}"
+
+
+def _fallback_svg_bytes(title: str, caption: str) -> bytes:
+    safe_title = html.escape(title[:80])
+    safe_caption = html.escape(caption[:120])
+    svg = f"""<svg xmlns="http://www.w3.org/2000/svg" width="1536" height="1024" viewBox="0 0 1536 1024">
+  <rect width="1536" height="1024" fill="#f7f4ef"/>
+  <rect x="96" y="96" width="1344" height="832" rx="34" fill="#ffffff" stroke="#24292f" stroke-width="6"/>
+  <circle cx="232" cy="240" r="64" fill="#1f6feb"/>
+  <circle cx="232" cy="512" r="64" fill="#2da44e"/>
+  <circle cx="232" cy="784" r="64" fill="#bf8700"/>
+  <path d="M296 240 H1256 M296 512 H1256 M296 784 H1256" stroke="#24292f" stroke-width="12" stroke-linecap="round"/>
+  <path d="M1032 216 L1256 216 L1184 144 M1256 216 L1184 288" fill="none" stroke="#1f6feb" stroke-width="14" stroke-linecap="round" stroke-linejoin="round"/>
+  <text x="384" y="372" fill="#24292f" font-family="Arial, sans-serif" font-size="68" font-weight="700">{safe_title}</text>
+  <text x="384" y="612" fill="#57606a" font-family="Arial, sans-serif" font-size="38">{safe_caption}</text>
+  <text x="384" y="700" fill="#57606a" font-family="Arial, sans-serif" font-size="34">Generated fallback visual</text>
+</svg>
+"""
+    return svg.encode("utf-8")
 
 
 def generate_and_place_images(state: State) -> dict:
@@ -772,7 +874,7 @@ def generate_and_place_images(state: State) -> dict:
 
     for spec in image_specs:
         placeholder = spec["placeholder"]
-        filename = spec["filename"]
+        filename = _safe_image_filename(spec.get("filename", ""), placeholder.strip("[]").lower())
         out_path = images_dir / filename
 
         # generate only if needed
@@ -781,15 +883,14 @@ def generate_and_place_images(state: State) -> dict:
                 img_bytes = _gemini_generate_image_bytes(spec["prompt"])
                 out_path.write_bytes(img_bytes)
             except Exception as e:
-                # graceful fallback: keep doc usable
-                prompt_block = (
-                    f"> **[IMAGE GENERATION FAILED]** {spec.get('caption','')}\n>\n"
-                    f"> **Alt:** {spec.get('alt','')}\n>\n"
-                    f"> **Prompt:** {spec.get('prompt','')}\n>\n"
-                    f"> **Error:** {e}\n"
+                filename = f"{Path(filename).stem}.svg"
+                out_path = images_dir / filename
+                out_path.write_bytes(
+                    _fallback_svg_bytes(
+                        spec.get("alt") or plan.blog_title,
+                        spec.get("caption") or "A generated visual for this blog.",
+                    )
                 )
-                md = md.replace(placeholder, prompt_block)
-                continue
 
         img_md = f"![{spec['alt']}](images/{filename})\n*{spec['caption']}*"
         md = md.replace(placeholder, img_md)
