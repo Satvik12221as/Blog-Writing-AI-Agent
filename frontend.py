@@ -145,11 +145,11 @@ def render_markdown_with_local_images(md: str):
                     parts[i + 1] = ("md", rest)
 
         if src.startswith("http://") or src.startswith("https://"):
-            st.image(src, caption=caption or (alt or None), use_container_width=True)
+            st.image(src, caption=caption or (alt or None), use_column_width=True)
         else:
             img_path = _resolve_image_path(src)
             if img_path.exists():
-                st.image(str(img_path), caption=caption or (alt or None), use_container_width=True)
+                st.image(str(img_path), caption=caption or (alt or None), use_column_width=True)
             else:
                 st.warning(f"Image not found: `{src}` (looked for `{img_path}`)")
 
@@ -465,7 +465,7 @@ if out:
                     st.warning("images/ exists but is empty.")
                 else:
                     for p in sorted(files):
-                        st.image(str(p), caption=p.name, use_container_width=True)
+                        st.image(str(p), caption=p.name, use_column_width=True)
 
                 z = images_zip(images_dir)
                 if z:
