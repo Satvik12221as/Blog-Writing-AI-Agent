@@ -186,7 +186,7 @@ def extract_title_from_md(md: str, fallback: str) -> str:
 
 
 # -----------------------------
-# Streamlit UI
+# Streamlit UI.
 # -----------------------------
 st.set_page_config(
     page_title="AI Blog Writing Agent",
